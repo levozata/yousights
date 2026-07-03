@@ -1,0 +1,397 @@
+// Yousights — synthetic user research platform
+// Data model per build spec §2. See README.md for module -> table mapping.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Workspace & auth (minimal, see §11 team & sharing)
+// ---------------------------------------------------------------------------
+
+model Workspace {
+  id        String   @id @default(cuid())
+  name      String
+  region    String   @default("eu") // data residency flag, §11 GDPR-native
+  createdAt DateTime @default(now())
+
+  users          User[]
+  personas       Persona[]
+  segments       Segment[]
+  stimuli        Stimulus[]
+  studies        Study[]
+  journeys       Journey[]
+  loadedPacks    LoadedPack[]
+}
+
+model User {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  name        String?
+  role        String   @default("member") // member | admin
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Persona Studio (§3)
+// ---------------------------------------------------------------------------
+
+enum PersonaOrigin {
+  BRIEF          // write-a-brief, AI-expanded
+  GROUNDED       // ground-from-data
+  WEB_ENRICHED   // research-from-public-web
+  PACK           // seeded from a sector pack
+}
+
+model Persona {
+  id          String        @id @default(cuid())
+  workspaceId String
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  name        String
+  tagline     String?
+  origin      PersonaOrigin @default(BRIEF)
+  tags        String[]      @default([])
+  archived    Boolean       @default(false)
+
+  // Identity
+  role          String?
+  demographics  Json?   // { ageRange, location, income, household, ... }
+  context       String? // free text: situation, environment
+
+  // Point of view
+  beliefs           String? // existing beliefs relevant to research domain
+  priorAttempts     String? // what they've already tried
+  skepticismSources String? // where their doubt comes from
+
+  // Behavioural constraints
+  decisionProcess String? // how they decide
+  consults        String? // who they consult before deciding
+  dealbreakers    String? // what makes them say no
+
+  // Psychographic layer — actually shapes the simulation system prompt (§8)
+  bigFive     Json?    // { openness, conscientiousness, extraversion, agreeableness, neuroticism } 0-100
+  values      String[] @default([])
+  motivations String?
+  decisionBehaviour String? // buying / decision-making behaviour summary
+
+  // Calibration & transparency (§3)
+  groundingStrength Int @default(0) // 0-100, recomputed when sources change
+
+  segmentId String?
+  segment   Segment? @relation(fields: [segmentId], references: [id], onDelete: SetNull)
+
+  groundingSources GroundingSource[]
+  provenance       PersonaFieldProvenance[]
+  studyParticipants StudyParticipant[]
+  journeySessions  JourneySession[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([workspaceId])
+  @@index([segmentId])
+}
+
+enum GroundingSourceType {
+  TRANSCRIPT
+  CRM_NOTE
+  REVIEW
+  SUPPORT_TICKET
+  SURVEY_VERBATIM
+  SALES_CALL
+  WEB_RESEARCH
+  OTHER
+}
+
+model GroundingSource {
+  id        String              @id @default(cuid())
+  personaId String
+  persona   Persona             @relation(fields: [personaId], references: [id], onDelete: Cascade)
+  type      GroundingSourceType
+  title     String
+  rawText   String
+  fileName  String?
+  citationUrl String? // for WEB_RESEARCH provenance
+  createdAt DateTime            @default(now())
+
+  chunks GroundingChunk[]
+
+  @@index([personaId])
+}
+
+model GroundingChunk {
+  id         String          @id @default(cuid())
+  sourceId   String
+  source     GroundingSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  personaId  String
+  chunkIndex Int
+  content    String
+  embedding  Float[]
+  createdAt  DateTime        @default(now())
+
+  @@index([personaId])
+  @@index([sourceId])
+}
+
+// Which persona field was pre-filled from which grounding source (§3 transparency)
+model PersonaFieldProvenance {
+  id        String   @id @default(cuid())
+  personaId String
+  persona   Persona  @relation(fields: [personaId], references: [id], onDelete: Cascade)
+  fieldName String
+  sourceId  String?
+  sourceLabel String // human-readable source name (kept even if source deleted)
+  createdAt DateTime @default(now())
+
+  @@index([personaId])
+}
+
+model Segment {
+  id          String   @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  definition  String
+  quotas      Json?   // { targetCount, variationNotes }
+  tags        String[] @default([])
+  createdAt   DateTime @default(now())
+
+  personas Persona[]
+
+  @@index([workspaceId])
+}
+
+// ---------------------------------------------------------------------------
+// Stimulus & Study (§5)
+// ---------------------------------------------------------------------------
+
+enum StimulusType {
+  TEXT
+  URL
+  IMAGE
+  PDF
+  FIGMA
+  PROTOTYPE
+}
+
+model Stimulus {
+  id          String       @id @default(cuid())
+  workspaceId String
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  type        StimulusType
+  title       String
+  content     String?  // text body or extracted text
+  url         String?
+  fileName    String?
+  metadata    Json?
+  createdAt   DateTime     @default(now())
+
+  studies Study[]
+
+  @@index([workspaceId])
+}
+
+enum StudyType {
+  UX_WALKTHROUGH
+  CONCEPT_TEST
+  PRODUCT_VALIDATION
+  MESSAGE_TEST
+  SEGMENTATION
+}
+
+enum PromptPattern {
+  EXPLAIN_AND_EVALUATE
+  COMPARE_AND_JUSTIFY
+  OBJECTION_SURFACE
+  STANDARD
+}
+
+enum ConfidenceMode {
+  STATED_PREFERENCE   // stronger
+  PREDICTED_BEHAVIOUR // weaker — down-weight in synthesis (§8, §9)
+}
+
+model Study {
+  id              String         @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  type            StudyType
+  researchQuestion String        // required single-sentence question (§5)
+  promptPattern   PromptPattern  @default(STANDARD)
+  confidenceMode  ConfidenceMode @default(STATED_PREFERENCE)
+
+  stimulusId String?
+  stimulus   Stimulus? @relation(fields: [stimulusId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  runs Run[]
+
+  @@index([workspaceId])
+}
+
+enum RunMode {
+  SOLO  // 1:1 depth
+  PANEL // breadth, 5-50+
+}
+
+enum RunStatus {
+  PENDING
+  STREAMING
+  COMPLETE
+  FAILED
+}
+
+model Run {
+  id        String    @id @default(cuid())
+  studyId   String
+  study     Study     @relation(fields: [studyId], references: [id], onDelete: Cascade)
+  mode      RunMode
+  panelPreset String? // Customer Panel | User Panel | Expert Panel | Stakeholder Panel
+  status    RunStatus @default(PENDING)
+  createdAt DateTime  @default(now())
+  completedAt DateTime?
+
+  participants StudyParticipant[]
+  insight      Insight?
+
+  @@index([studyId])
+}
+
+model StudyParticipant {
+  id        String   @id @default(cuid())
+  runId     String
+  run       Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  personaId String
+  persona   Persona  @relation(fields: [personaId], references: [id], onDelete: Cascade)
+
+  session Session?
+
+  @@index([runId])
+  @@index([personaId])
+}
+
+enum MessageRole {
+  SYSTEM
+  RESEARCHER
+  PERSONA
+}
+
+model Session {
+  id                 String           @id @default(cuid())
+  studyParticipantId String           @unique
+  studyParticipant   StudyParticipant @relation(fields: [studyParticipantId], references: [id], onDelete: Cascade)
+  status             RunStatus        @default(PENDING)
+  createdAt          DateTime         @default(now())
+
+  messages Message[]
+}
+
+model Message {
+  id          String      @id @default(cuid())
+  sessionId   String
+  session     Session     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role        MessageRole
+  content     String
+  isFollowUp  Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+
+  @@index([sessionId])
+}
+
+// ---------------------------------------------------------------------------
+// Synthesis & insights (§7)
+// ---------------------------------------------------------------------------
+
+enum Recommendation {
+  SHIP
+  KILL
+  REFINE
+}
+
+model Insight {
+  id             String         @id @default(cuid())
+  runId          String         @unique
+  run            Run            @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  distribution     Json  // [{ label, sentiment: positive|negative|mixed, personaIds: [] }]
+  themes           Json  // [{ title, summary, quotes: [{sessionId, messageId, personaId, personaName, excerpt}] }]
+  divergences      Json  // [{ title, summary, sideA, sideB, quotes: [...] }]
+  unexpectedAngles Json  // [{ title, summary, quotes: [...] }]
+
+  recommendation      Recommendation
+  recommendationNote  String
+  confidenceNote       String // honesty framing per §8/§9
+
+  createdAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Journey mapping (§4)
+// ---------------------------------------------------------------------------
+
+model Journey {
+  id          String   @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  stages      Json     // [{ key, label }]
+  scaffoldSource String? // e.g. sector pack slug, or "custom"
+  createdAt   DateTime @default(now())
+
+  sessions JourneySession[]
+
+  @@index([workspaceId])
+}
+
+model JourneySession {
+  id        String   @id @default(cuid())
+  journeyId String
+  journey   Journey  @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  personaId String
+  persona   Persona  @relation(fields: [personaId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  stageResponses JourneyStageResponse[]
+
+  @@index([journeyId])
+  @@index([personaId])
+}
+
+model JourneyStageResponse {
+  id               String         @id @default(cuid())
+  journeySessionId String
+  journeySession   JourneySession @relation(fields: [journeySessionId], references: [id], onDelete: Cascade)
+  stageKey         String
+  action           String?
+  thought          String?
+  emotionValence   Int?    // -2..2
+  emotionIntensity Int?    // 0..100
+  painPoint        String?
+  opportunity      String?
+  createdAt        DateTime @default(now())
+
+  @@index([journeySessionId])
+}
+
+// ---------------------------------------------------------------------------
+// Sector packs (§14) — tracks which packs a workspace has loaded
+// ---------------------------------------------------------------------------
+
+model LoadedPack {
+  id          String   @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  slug        String
+  loadedAt    DateTime @default(now())
+
+  @@unique([workspaceId, slug])
+}
